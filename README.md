@@ -6,7 +6,9 @@
 use "make" to create executable. then run ./lets-talk [my port number] [remote/local machine IP] [remote/local port number]
 Example: lets-talk 6060 IP_of_machine2  6001
 
+"!exit" will quit the connection
 
+_____________________________________________
 This project uses two main LINUX concepts: 
 1. Threads - creating a threads list and assigning tasks to them. 
 2. UDP 

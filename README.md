@@ -3,7 +3,7 @@
 ## "chat"-like facility that enables a user at one terminal to communicate with a user at another terminal.
 
 ### Use: 
-use "make" to create executable. then run /talk (your port) (remote machine) (remote port)
+use "make" to create executable. then run lets-talk [my port number] [remote/local machine IP] [remote/local port number]
 Example: lets-talk 6060 IP_of_machine2  6001
 
 

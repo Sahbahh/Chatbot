@@ -1,458 +1,260 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <pthread.h>
-
-#include <unistd.h>
-#include <string.h>
+#include <unistd.h> 
+#include <string.h> 
+#include <sys/types.h> 
+#include <sys/socket.h> 
+#include <arpa/inet.h> 
+#include <netinet/in.h> 
+#include "list.h"
 #include <sys/types.h>
 #include <sys/socket.h>
-#include <arpa/inet.h>
-#include <netinet/in.h>
-#include <signal.h>
+#include <netdb.h>
+#include <sys/time.h>
+#define STDIN 0 
 
-#include <semaphore.h>
+pthread_mutex_t Mutex = PTHREAD_MUTEX_INITIALIZER;
+bool term_signal = 1;
+char buffer[4000];
+int encryption_key = 1;
+struct thread_params {
+    int receiver_socketfd;
+    int sender_socketfd;
+    struct sockaddr_storage receiveraddr;
+    struct addrinfo * sender_servinfo, *sender_p, *receiver_p;
+    List * sending_list;
+    List * receiving_list;
+};
 
-#include "list.h"
-
-#define MAXLINE 4000
-#define KeyNUM 20
-// 0 = offline, 1 = online
-int status = false; 
-
-sem_t mutexSend;
-sem_t mutexRec;
-pthread_t sender, receive, keyboard, printer;
-const char *machine;
-
-List *IncommingMSGs;
-List *OutgoingMSGs;
-char MESSAGE_OUT[MAXLINE];
-char MESSAGE_IN[MAXLINE];
-int EXITCODE = false;
-char *ONLINE = "11-11\n";
-char *OFFLINE = "10-10\n";
-
-void cancelAllThread()
-{
-
-    pthread_cancel(printer);
-    printf("cancelled printer\n");
-
-    printf("cancelled sender\n");
-    pthread_cancel(sender);
-    printf("cancelled keyboard\n");
-    pthread_cancel(keyboard);
-    printf("cancelled receive\n");
-    pthread_cancel(receive);
-}
-
-int isCode(char *string)
-{
-    if (strcmp(string, ONLINE) == 0)
-    {
-        status = false;
-        return true;
-    }
-
-    else if (strcmp(string, OFFLINE) == 0)
-    {
-        status = false;
-        return true;
-    }
-    else
-    {
-        return false;
-    }
-}
-
-char *encrypt(char *message)
-{
-
-    char *newstring = malloc(strlen(message));
-
-    int key = KeyNUM;
-    // printf("Before: %s\n", message);
-
-    for (int i = 0; i < strlen(message); i++)
-    {
-        char letter = message[i];
-        letter = (letter + key) % 256;
-        newstring[i] = letter;
-    }
-
-    // printf("After: %s\n", newstring);
-    return newstring;
-}
-
-char *decrypt(char *message)
-{
-    char *newstring = malloc(strlen(message));
-
-    int key = 256 - KeyNUM;
-
-    for (int i = 0; i < strlen(message); i++)
-    {
-        char letter = message[i];
-        letter = (letter + key) % 256;
-        newstring[i] = letter;
-    }
-
-    return newstring;
-}
-
-void *input(void *ptr)
-{
-
-    // printf("Input Thread started\n");
-
-    char *lineBuffer = malloc(sizeof(char) * MAXLINE);
-    // printf("LOCKING at INPUT\n");
-
-    while (EXITCODE == false && sem_wait(&mutexSend) == 0)
-    {
-        // printf("LOCKED at INPUT\n");
-        if (fgets(lineBuffer, MAXLINE, stdin) != NULL)
-        {
-
-            // printf("Got line\n");
+void *receive_msg(void * ptr) {
+    struct thread_params *params = ptr;
+    int i;
+    while(term_signal) {
+        char buf[4000];
+        socklen_t addr_len;
+        int numbytes;
+        addr_len = sizeof params->receiveraddr;
+        if ((numbytes = recvfrom(params->receiver_socketfd, buf, 4000 , 0,
+            (struct sockaddr *)&(params->receiveraddr), &addr_len)) == -1) {
+            perror("recvfrom");
+            exit(1);
         }
 
-        if (EXITCODE == true)
-        {
-            free(lineBuffer);
-            break;
-        }
-
-        // printf("%s", lineBuffer);
-        if (strcmp(lineBuffer, "!exit\n") == 0)
-        {
-            // printf("Pressed exit\n");
-            EXITCODE = true;
-
-            break;
-        }
-
-        if (strcmp(lineBuffer, "!status\n") == 0)
-        {
-            if (status == true)
-            {
-                printf("Online\n");
+        buf[numbytes] = '\0';
+        // decryption
+        for(i = 0; i < strlen(buf); i++) {
+            if(buf[i] != '\n' && buf[i] != '\0') {
+                buf[i] -= encryption_key;
             }
-            else
-            {
-                printf("Offline\n");
+        }
+
+        List_add(params->receiving_list, (char *) buf);
+        
+        if(strcmp(buf, "!status\n") == 0) {
+            int numbytes2;
+            char * msg = "Online";
+            if ((numbytes2 = sendto(params->receiver_socketfd, msg, strlen(msg), 0,
+                (struct sockaddr *)&(params->receiveraddr), addr_len)) == -1) {
+                perror("talker: sendto");
+                exit(1);
             }
-
-            strcpy(MESSAGE_OUT, "\0");
-        }
-        else
-        {
-            strcpy(MESSAGE_OUT, lineBuffer);
-        }
-
-        // printf("UNLOCKED at INPUT\n");
-        //release resources
-        sem_post(&mutexSend);
-        sleep(1);
+            
+        }        
     }
+    pthread_exit(NULL);
 
-    // printf("exiting input\n");
-    sem_post(&mutexSend);
+}
+void *print_msg(void * ptr) {
+    struct thread_params *params = ptr;
+    while(term_signal) {
+        if(List_count(params->receiving_list)) {
+            char * msg = List_remove(params->receiving_list);  
+            printf("%s", msg);
+            fflush(stdout);
+            if(strcmp(msg, "!exit\n") == 0) {
+                term_signal = 0;
+            }
+        }
+    }
+    pthread_exit(NULL);
 
-    return 0;
+}
+void *send_msg(void * ptr) {
+    struct thread_params *params = ptr;
+    int i;
+    while(term_signal) {
+        if(List_count(params->sending_list)) {
+            char * msg = List_remove(params->sending_list);
+            // encryption
+            for(i = 0; i < strlen(msg); i++) {
+                if(msg[i] != '\n' && msg[i] != '\0') {
+                    msg[i] += encryption_key;
+                }
+            }
+            int numbytes;
+            if ((numbytes = sendto(params->sender_socketfd, msg, strlen(msg), 0,
+                (params->sender_p)->ai_addr, (params->sender_p)->ai_addrlen)) == -1) {
+                perror("talker: sendto");
+                exit(1);
+            }
+            for(i = 0; i < strlen(msg); i++) {
+                if(msg[i] != '\n' && msg[i] != '\0') {
+                    msg[i] -= encryption_key;
+                }
+            }
+            if(strcmp(msg, "!exit\n") == 0) {
+                term_signal = 0;
+            }
+            if(strcmp(msg, "!status\n") == 0) {
+                char buf[4000];
+                socklen_t addr_len;
+                int numbytes2;
+                addr_len = (params->sender_p)->ai_addrlen;
+                struct timeval tv;
+                tv.tv_sec = 0;
+                tv.tv_usec = 100000;
+                if (setsockopt(params->sender_socketfd, SOL_SOCKET, SO_RCVTIMEO,&tv,sizeof(tv)) < 0) {
+                    perror("Error");
+                }
+                if ((numbytes2 = recvfrom(params->sender_socketfd, buf, 4000 , 0,
+                    (params->sender_p)->ai_addr, &addr_len)) == -1) {
+                    strcpy(buf, "Offline");
+                    printf("Offline\n");
+                }
+                if(strcmp(buf, "Online") == 0) {
+                    buf[numbytes2] = '\0';
+                    printf("%s\n", buf);
+                }
+                
+            }     
+        }
+    }
+    pthread_exit(NULL);
+
+}
+void *input_msg(void * ptr) {
+    struct thread_params *params = ptr;
+    printf("Welcome to lets-talk! Please type your message now\n");
+    while(term_signal) {
+        if(fgets(buffer, 4000, stdin)){
+            List_add(params->sending_list, (char *)buffer);
+        }
+    } 
+    pthread_exit(NULL);
 }
 
-void *sending(void *ClientPort) // client
+int main (int argc, char ** argv) 
 {
-
-    // printf("Sending thread started\n");
-
-    int PORT = *(int *)ClientPort;
-    // printf("Sending to: %d\n",PORT );
+    //RECEIVER
     int sockfd;
-    char buffer[MAXLINE];
-    char *message;
-    struct sockaddr_in servaddr;
+    struct addrinfo hints, *servinfo, *p;
+    int rv;
+    struct sockaddr_storage their_addr;
+    
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET6; // set to AF_INET to use IPv4
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_flags = AI_PASSIVE; // use my IP
 
-    // Creating socket file descriptor
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
-    {
-        perror("socket creation failed");
-        exit(EXIT_FAILURE);
+    if ((rv = getaddrinfo(NULL, argv[1], &hints, &servinfo)) != 0) {
+        freeaddrinfo(servinfo);
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(rv));
+        return 1;
     }
 
-    memset(&servaddr, 0, sizeof(servaddr));
-
-    // Filling server information
-    servaddr.sin_family = AF_INET;
-    servaddr.sin_port = htons(PORT);
-    servaddr.sin_addr.s_addr = inet_addr(machine);
-
-    //server settings are done.
-    sleep(2);
-
-    sendto(sockfd, (const char *)ONLINE, strlen(ONLINE), MSG_CONFIRM, (const struct sockaddr *)&servaddr, sizeof(servaddr));
-    while (EXITCODE == false && sem_wait(&mutexSend) == 0)
-    {
-        // printf("LOCKED at SEND\n");
-        // printf("Message to be sent: %s", MESSAGE_OUT);
-        if (EXITCODE == true)
-        {
-            break;
-        }
-
-        if (strcmp(MESSAGE_OUT, "") != 0)
-        {
-
-            message = encrypt(MESSAGE_OUT);
-            sendto(sockfd, (const char *)message, strlen(MESSAGE_OUT), MSG_CONFIRM, (const struct sockaddr *)&servaddr, sizeof(servaddr));
-        }
-
-        // printf("UNLOCKED in SEND \n");
-        sem_post(&mutexSend);
-
-        sleep(2);
-        // realesed the resource
-    }
-
-    // printf("Exiting Sending and sent exit\n");
-    sendto(sockfd, (const char *)OFFLINE, strlen(OFFLINE), MSG_CONFIRM, (const struct sockaddr *)&servaddr, sizeof(servaddr));
-    // sleep(40);
-
-    close(sockfd);
-    return 0;
-}
-
-int getMsg()
-{
-
-    char *ptr;
-    char *word;
-
-    List_first(IncommingMSGs);
-    ptr = List_remove(IncommingMSGs);
-    List_last(IncommingMSGs);
-
-    memcpy(word, ptr, MAXLINE);
-    printf("%s\n", word);
-    free(ptr);
-    return 0;
-}
-
-void *printing(void *recList)
-{
-    sleep(2);
-
-    while (EXITCODE != true && sem_wait(&mutexRec) == 0)
-    {
-        // printf("LOCKED AT PRINT\n");
-        if (EXITCODE == true)
-        {
-            printf("Found exit code\n");
-            break;
-        }
-
-        char *ptr;
-        char *word;
-        if (List_count(IncommingMSGs) > 0)
-        {
-            // printf("count: |%d|\n", List_count(IncommingMSGs));
-            List_first(IncommingMSGs);
-            ptr = List_remove(IncommingMSGs); // valgrind ?
-
-            List_last(IncommingMSGs);
-            // printf("Pointer: |%s|\n", ptr);
-            // memccpy(word, ptr, '\0', MAXLINE);
-            printf(" %s\n", ptr);
-
-            free(ptr);
-        }
-
-        // printf("UNLOCKED AT PRINT\n");
-
-        sem_post(&mutexRec);
-        sleep(2);
-    }
-    sem_post(&mutexRec);
-    // printf("Exiting Printing\n");
-    // sleep(40);
-
-    return 0;
-}
-
-void storeMsg(char *string)
-{
-
-    if (strcmp(string, "\0") != 0)
-    {
-
-        char *decrypted = decrypt(string);
-
-        // printf("storing new string: %s\n", string);
-
-        List_append(IncommingMSGs, decrypted);
-    }
-
-    return;
-}
-
-void *receiving(void *ServerPort) // server
-{
-    int PORT = *(int *)ServerPort;
-    // printf("Receive thread %d \n", PORT);
-    int sockfd;
-    char buffer[MAXLINE];
-
-    struct sockaddr_in servaddr, cliaddr;
-
-    // Creating socket file descriptor
-    if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
-    {
-        perror("socket creation failed");
-        exit(EXIT_FAILURE);
-    }
-
-    memset(&servaddr, 0, sizeof(servaddr));
-    memset(&cliaddr, 0, sizeof(cliaddr));
-
-    // Filling server information
-    servaddr.sin_family = AF_INET; // IPv4
-    servaddr.sin_addr.s_addr = INADDR_ANY;
-    servaddr.sin_port = htons(PORT);
-
-    // Bind the socket with the server address
-    if (bind(sockfd, (const struct sockaddr *)&servaddr, sizeof(servaddr)) < 0)
-    {
-        perror("bind failed");
-        exit(EXIT_FAILURE);
-    }
-    else
-    {
-        // printf("Binded Succesfully\n");
-    }
-    //finished socket set up
-
-    struct timeval timeout;
-    timeout.tv_sec = 0;
-    timeout.tv_usec = 10;
-
-    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, (char *)&timeout, sizeof(timeout)) < 0)
-    {
-        printf("Error in the making timeout\n");
-    }
-
-    int len, n;
-    len = sizeof(cliaddr);
-
-    // printf("WANT LOCK AT Rec\n");
-    while (EXITCODE == false)
-    {
-        // printf("LOCKED at Rec\n");
-
-        sem_wait(&mutexRec);
-        n = recvfrom(sockfd, (char *)buffer, MAXLINE, MSG_WAITALL, (struct sockaddr *)&cliaddr, &len);
-        // printf("Receiving message\n");
-        fflush(stdout);
-        buffer[n] = '\0';
-        buffer[n - 1] = '\0';
-
-        if (strcmp(buffer, "\0") == 0)
-        {
-            sem_post(&mutexRec);
+    // loop through all the results and bind to the first we can
+    for(p = servinfo; p != NULL; p = p->ai_next) {
+        if ((sockfd = socket(p->ai_family, p->ai_socktype,
+                p->ai_protocol)) == -1) {
+            perror("listener: socket");
             continue;
         }
 
-        // printf("%s|\n", buffer);
-        if (strcmp(buffer, "11-11") == 0)
-        {
-            status = true;
-            // printf("iscode\n");
-        }
-        else if (strcmp(buffer, "10-10") == 0)
-        {
-
-            // printf("%s\n", buffer);
-
-            // printf("Received Exit\n");
-            EXITCODE = true;
+        if (bind(sockfd, p->ai_addr, p->ai_addrlen) == -1) {
+            close(sockfd);
+            perror("listener: bind");
+            continue;
         }
 
-        else
-        {
-            storeMsg(buffer);
-            buffer[0] = '\0';
+        break;
+    }
+
+    if (p == NULL) {
+        freeaddrinfo(servinfo);
+        fprintf(stderr, "listener: failed to bind socket\n");
+        return 2;
+    }
+
+    //SENDER
+    int sender_sockfd;
+    struct addrinfo sender_hints, *sender_servinfo, *sender_p;
+    int sender_rv;
+
+    memset(&sender_hints, 0, sizeof sender_hints);
+    sender_hints.ai_family = AF_INET6; // set to AF_INET to use IPv4
+    sender_hints.ai_socktype = SOCK_DGRAM;
+
+    if ((sender_rv = getaddrinfo(argv[2], argv[3], &sender_hints, &sender_servinfo)) != 0) {
+        freeaddrinfo(sender_servinfo);
+        fprintf(stderr, "getaddrinfo: %s\n", gai_strerror(sender_rv));
+        return 1;
+    }
+
+    // loop through all the results and make a socket
+    for(sender_p = sender_servinfo; sender_p != NULL; sender_p = sender_p->ai_next) {
+        if ((sender_sockfd = socket(sender_p->ai_family, sender_p->ai_socktype,
+                sender_p->ai_protocol)) == -1) {
+            perror("talker: socket");
+            continue;
         }
 
-        sem_post(&mutexRec);
-
-        sleep(1);
-    }
-    // printf("Exiting Receiving\n");
-    sem_post(&mutexSend);
-    sem_post(&mutexRec);
-    pthread_cancel(keyboard);
-
-    return 0;
-}
-
-int main(int argc, char const *argv[])
-{
-    sem_init(&mutexSend, 0, 1);
-    sem_init(&mutexRec, 0, 1);
-
-    int myPort, theirPort, arg3, arg4;
-
-    IncommingMSGs = List_create();
-    OutgoingMSGs = List_create();
-
-    if (argc < 3)
-    {
-        printf("Error, no sockets given\n");
-        exit(-1);
+        break;
     }
 
-    myPort = atoi(argv[1]);
-    if (strcmp("localhost", argv[2]) == 0)
-    {
-        machine = "127.0.0.1";
+    if (sender_p == NULL) {
+        freeaddrinfo(sender_servinfo);
+        fprintf(stderr, "talker: failed to create socket\n");
+        return 2;
     }
-    else
-    {
-        machine = argv[2];
-    }
+   
+    List * send_list;
+    send_list = List_create();
+    
+    List * receive_list;
+    receive_list = List_create();
 
-    theirPort = atoi(argv[3]);
+    struct thread_params params;
+    params.receiver_p = p;
+    params.receiveraddr = their_addr;
+    params.receiver_socketfd = sockfd;
+    params.sender_socketfd = sender_sockfd;
+    params.sender_servinfo = sender_servinfo;
+    params.sender_p = sender_p;
+    params.sending_list = send_list;
+    params.receiving_list = receive_list;
 
-    // printf("Server Port: %d\n", arg1); // server will recieve
-    //printf("Client Port: %d\n", arg2); // client will send
-    printf("Welcome to Lets-Talk! Please type your messages now\n");
-    if (pthread_create(&keyboard, NULL, input, (void *)&arg3) == 0)
-    {
-        // printf("Created keyboard thread\n");
-    }
+    pthread_t receiving_thr, printer_thr, sending_thr, keyboard_thr;
 
-    if (pthread_create(&receive, NULL, receiving, (void *)&myPort) == 0)
-    {
-        // printf("Created receive thread\n");
-    }
+    //create threads for receiving and printing messages
+    pthread_create(&keyboard_thr, NULL, input_msg, &params);
+    pthread_create(&sending_thr, NULL, send_msg, &params);
+    pthread_create(&receiving_thr, NULL, receive_msg, &params);
+    pthread_create(&printer_thr, NULL, print_msg, &params);
 
-    if (pthread_create(&sender, NULL, sending, (void *)&theirPort) == 0)
-    {
-        // printf("Created sender thread\n");
-    }
-    if (pthread_create(&printer, NULL, printing, (void *)&theirPort) == 0)
-    {
-        // printf("Created sender thread\n");
-    }
+    while(term_signal);
+    pthread_cancel(keyboard_thr);
+    pthread_cancel(sending_thr);
+    pthread_cancel(receiving_thr);
+    pthread_cancel(printer_thr);
 
-    pthread_join(sender, NULL);
-    pthread_join(keyboard, NULL);
-    pthread_join(printer, NULL);
-    pthread_join(receive, NULL);
+    pthread_join(keyboard_thr, NULL);
+    pthread_join(sending_thr, NULL);
+    pthread_join(receiving_thr, NULL);
+    pthread_join(printer_thr, NULL);
 
-    sem_destroy(&mutexSend);
-    sem_destroy(&mutexRec);
+    freeaddrinfo(servinfo);
+    freeaddrinfo(sender_servinfo);
 
-    // printf("Exit\n");
-    return 0;
+    pthread_exit(0);
 }

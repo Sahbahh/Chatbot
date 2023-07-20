@@ -3,497 +3,470 @@
 #include <assert.h>
 #include <pthread.h>
 
-// Complete structs from .h
-typedef struct Node_s Node;
-struct Node_s {
-    void* pItem;
-    Node* pNext;
-    Node* pPrev;
+// Node structure for list
+typedef struct Node_t Node;
+struct Node_t {
+    void* data;
+    Node* next;
+    Node* previous;
 };
 
-enum ListOutOfBounds {
-    LIST_OOB_START,
-    LIST_OOB_END
-};
-typedef struct List_s List;
-struct List_s {
-    Node* pFirstNode;
-    Node* pLastNode;
-    Node* pCurrentNode;
-    int count;
-    List* pNextFreeHead;
-    enum ListOutOfBounds lastOutOfBoundsReason;
+// List structure for linked list
+typedef struct List_t List;
+struct List_t {
+    Node* first;
+    Node* last;
+    Node* current;
+    int numOfItems;
+    List* nextFree;
+    int lastOutOfBoundsError;
 };
 
+// Static array for list heads and nodes
+static List listHeadsArray[LIST_MAX_NUM_HEADS];
+static Node listNodesArray[LIST_MAX_NUM_NODES];
+static List *firstFreeListHead;
+static Node *firstFreeListNode;
+static bool listInitialized = false;
 
-static List s_heads[LIST_MAX_NUM_HEADS];
-static Node s_nodes[LIST_MAX_NUM_NODES];
-static List *s_pFirstFreeHead;
-static Node *s_pFirstFreeNode;
-static bool s_isInitialized = false;
+// Error codes for out of bounds conditions
+#define LIST_START_OUT_OF_BOUNDS -1
+#define LIST_END_OUT_OF_BOUNDS -2
 
-/* Private Headers */
-static void initializeDataStructures();
-static bool isOOBAtStart();
-static bool isOOBAtEnd();
+// Mutex for thread-safety
+static pthread_mutex_t listMutex = PTHREAD_MUTEX_INITIALIZER;
 
-// thread-safe (recursive)
-static pthread_mutex_t s_listMutex = PTHREAD_MUTEX_INITIALIZER;
-static void mutexInitialize(void) 
+/* Function Declarations */
+static void initializeList();
+static bool checkOutOfBoundsStart(List* list);
+static bool checkOutOfBoundsEnd(List* list);
+
+// Mutex related functions
+static void initializeMutex() 
 {   
-    // Recursive mutex
-    // https://stackoverflow.com/questions/7037481/c-how-do-you-declare-a-recursive-mutex-with-posix-threads
-    pthread_mutexattr_t Attr;
-    pthread_mutexattr_init(&Attr);
-    pthread_mutexattr_settype(&Attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutexattr_t MutexAttr;
+    pthread_mutexattr_init(&MutexAttr);
+    pthread_mutexattr_settype(&MutexAttr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&listMutex, &MutexAttr);
+    pthread_mutexattr_destroy(&MutexAttr);
+}
+static void lockListMutex()
+{
+    pthread_mutex_lock(&listMutex);
+}
+static void unlockListMutex()
+{
+    pthread_mutex_unlock(&listMutex);
+}
 
-    pthread_mutex_init(&s_listMutex, &Attr);
+// Function to create a new list
+List* createNewList()
+{
+    if (!listInitialized) {
+        initializeList();
+    }
+
+    lockListMutex();
+
+    List* newList = firstFreeListHead;
+    if (newList) {
+        firstFreeListHead = firstFreeListHead->nextFree;
+        newList->nextFree = NULL;
+    }
+
+    unlockListMutex();
+    return newList;
+}
+
+// Function to get the size of the list
+int getListSize(List* list)
+{
+    lockListMutex();
+    int size = list->numOfItems;
+    unlockListMutex();
+    return size;
+}
+
+// Function to get the first element in the list
+void* getFirstElement(List* list)
+{
+    lockListMutex();
+    list->current = list->first;
+    void *data = getCurrentData(list);
+    unlockListMutex();
+    return data;
+}
+
+// Function to get the last element in the list
+void* getLastElement(List* list)
+{
+    lockListMutex();
+    list->current = list->last;
+    void *data = getCurrentData(list);
+    unlockListMutex();
+    return data;
+}
+
+// Function to get the next element in the list
+void* getNextElement(List* list)
+{
+    lockListMutex();
+    if (checkOutOfBoundsStart(list)) {
+        list->current = list->first;
+    } else if(!checkOutOfBoundsEnd(list)) {
+        list->current = list->current->next;
+    }
+
+    if (list->current == NULL) {
+        list->lastOutOfBoundsError = LIST_END_OUT_OF_BOUNDS;
+    }
+
+    void* data = getCurrentData(list);
+    unlockListMutex();
+    return data;
+}
+
+// Function to get the previous element in the list
+void* getPrevElement(List* list)
+{
+    lockListMutex();
+    if (checkOutOfBoundsEnd(list)) {
+        list->current = list->last;
+    } else if(!checkOutOfBoundsStart(list)){
+        list->current = list->current->previous;
+    }
+
+    if (list->current == NULL) {
+        list->lastOutOfBoundsError = LIST_START_OUT_OF_BOUNDS;
+    }
     
-    pthread_mutexattr_destroy(&Attr);
-}
-static void mutexLock(void)
-{
-    pthread_mutex_lock(&s_listMutex);
-}
-static void mutexUnlock(void)
-{
-    pthread_mutex_unlock(&s_listMutex);
+    void* data = getCurrentData(list);
+    unlockListMutex();
+    return data;
 }
 
-
-List* List_create()
+// Current Item in the List
+void* ListItem(List* givenList)
 {
-    if (!s_isInitialized) {
-        initializeDataStructures();
+    lockMutex();
+    void* item = NULL;
+    if (givenList->currentNode != NULL) {
+        item = givenList->currentNode->item;
     }
-
-    mutexLock();
-
-    // Get next free head
-    List* pList = s_pFirstFreeHead;
-    if (pList) {
-        s_pFirstFreeHead = s_pFirstFreeHead->pNextFreeHead;
-        pList->pNextFreeHead = NULL;
-    }
-
-    mutexUnlock();
-    return pList;
+    unlockMutex();
+    return item;
 }
 
-
-int List_count(List* pList)
+// Function to check if no nodes are available
+static bool isNodesEmpty()
 {
-    mutexLock();
-    int count = pList->count;
-    mutexUnlock();
-    return count;
+    return freeNode == NULL;
 }
 
-void* List_first(List* pList)
+// Function to create a new node and assign an item to it
+static Node* createNode(void* item) 
 {
-    mutexLock();
-    // Point current to first
-    pList->pCurrentNode = pList->pFirstNode;
-    void *pItem = List_curr(pList);
-    mutexUnlock();
-    return pItem;
+    assert(!isNodesEmpty());
+    Node* newNode = freeNode;
+    newNode->item = item;
+    freeNode = freeNode->next;
+    newNode->next = NULL;
+    return newNode;
 }
 
-void* List_last(List* pList)
+// Function to link a new node at the start of the list
+static void addNodeAtStart(List* givenList, Node* newNode)
 {
-    mutexLock();
-    pList->pCurrentNode = pList->pLastNode;
-    void *pItem = List_curr(pList);
-    mutexUnlock();
-    return pItem;
-}
-
-
-void* List_next(List* pList)
-{
-    mutexLock();
-    // When before the list, move to first node
-    if (isOOBAtStart(pList)) {
-        pList->pCurrentNode = pList->pFirstNode;
-    } else if(isOOBAtEnd(pList)) {
-        // do nothing
+    newNode->prev = NULL;
+    newNode->next = givenList->firstNode;
+    if (givenList->count >= 1) {
+        givenList->firstNode->prev = newNode;
     } else {
-        pList->pCurrentNode = pList->pCurrentNode->pNext;
+        givenList->lastNode = newNode;
     }
-
-    // If after the list; record reason
-    if (pList->pCurrentNode == NULL) {
-        pList->lastOutOfBoundsReason = LIST_OOB_END;
-    }
-
-    void* pItem = List_curr(pList);
-    mutexUnlock();
-    return pItem;
+    givenList->firstNode = newNode;
+    givenList->currentNode = newNode;
+    givenList->count++;
 }
 
-
-void* List_prev(List* pList)
+// Function to link a new node at the end of the list
+static void addNodeAtEnd(List* givenList, Node* newNode)
 {
-    mutexLock();
-    // When after the list, move to last node
-    if (isOOBAtEnd(pList)) {
-       pList->pCurrentNode = pList->pLastNode;
-    } else if(isOOBAtStart(pList)){
-        // do nothing
+    newNode->prev = givenList->lastNode;
+    newNode->next = NULL;
+    if (givenList->count >= 1) {
+        givenList->lastNode->next = newNode;
     } else {
-        pList->pCurrentNode = pList->pCurrentNode->pPrev;
+        givenList->firstNode = newNode;
     }
-
-    // If after the list; record reason
-    if (pList->pCurrentNode == NULL) {
-        pList->lastOutOfBoundsReason = LIST_OOB_START;
-    }
-    void* pItem = List_curr(pList);
-    mutexUnlock();
-    return pItem;
+    givenList->lastNode = newNode;
+    givenList->currentNode = newNode;
+    givenList->count++;
 }
 
-void* List_curr(List* pList)
+// Function to add a node after the current node in the list
+static void addNodeAfterCurrent(List* givenList, Node* newNode)
 {
-    mutexLock();
-    void* pItem = NULL;
-    if (pList->pCurrentNode != NULL) {
-        pItem = pList->pCurrentNode->pItem;
-    }
-    mutexUnlock();
-    return pItem;
-}
-
-
-static bool haveNoFreeNodes()
-{
-    return s_pFirstFreeNode == NULL;
-}
-static Node* makeNewNode(void* pItem) 
-{
-    assert(!haveNoFreeNodes());
-    Node* pNode = s_pFirstFreeNode;
-    pNode->pItem = pItem;
-    s_pFirstFreeNode = s_pFirstFreeNode->pNext;
-    pNode->pNext = NULL;
-    return pNode;
-}
-static void linkNodeAtStart(List* pList, Node* pNode)
-{
-    pNode->pPrev = NULL;
-    pNode->pNext = pList->pFirstNode;
-    if (pList->count >= 1) {
-        pList->pFirstNode->pPrev = pNode;
-    } else {
-        pList->pLastNode = pNode;
-    }
-
-    pList->pFirstNode = pNode;
-    pList->pCurrentNode = pNode;
-    pList->count++;
-}
-static void linkNodeAtEnd(List* pList, Node* pNode)
-{
-    pNode->pPrev = pList->pLastNode;
-    pNode->pNext = NULL;
-    if (pList->count >= 1) {
-        pList->pLastNode->pNext = pNode;
-    } else {
-        pList->pFirstNode = pNode;
-    }
-    pList->pLastNode = pNode;
-    pList->pCurrentNode = pNode;
-    pList->count++;
-}
-static void linkNodeAfterCurrent(List* pList, Node* pNode)
-{
-    // If current is at the last node, we are actually
-    // linking this to the end (must update last node ptr)
-    bool isInsertAtEnd = pList->pCurrentNode == pList->pLastNode
-        || isOOBAtEnd(pList);
+    bool isInsertAtEnd = givenList->currentNode == givenList->lastNode
+        || isOutOfBoundsEnd(givenList);
     if (isInsertAtEnd) {
-        linkNodeAtEnd(pList, pNode);
-    } else if (isOOBAtStart(pList)) {
-        linkNodeAtStart(pList, pNode);
+        addNodeAtEnd(givenList, newNode);
+    } else if (isOutOfBoundsStart(givenList)) {
+        addNodeAtStart(givenList, newNode);
     } else {
-        assert(pList->pCurrentNode != NULL);
-        pNode->pPrev = pList->pCurrentNode;
-        pNode->pNext = pList->pCurrentNode->pNext;
-        pList->pCurrentNode->pNext = pNode;
-        pNode->pNext->pPrev = pNode;
-        pList->pCurrentNode = pNode;
-        pList->count++;
+        assert(givenList->currentNode != NULL);
+        newNode->prev = givenList->currentNode;
+        newNode->next = givenList->currentNode->next;
+        givenList->currentNode->next = newNode;
+        newNode->next->prev = newNode;
+        givenList->currentNode = newNode;
+        givenList->count++;
     }
 }
 
-
-
-// Add after current
-int List_add(List* pList, void* pItem)
+// Function to add an item after the current item
+int ListAdd(List* givenList, void* item)
 {
-    mutexLock();
-    // Get free node
-    if (haveNoFreeNodes()) {
-        mutexUnlock();
+    lockMutex();
+    if (isNodesEmpty()) {
+        unlockMutex();
         return LIST_FAIL;
     }
-    Node* pNode = makeNewNode(pItem);
-    
-    // Insert
-    linkNodeAfterCurrent(pList, pNode);
-    mutexUnlock();
+    Node* newNode = createNode(item);
+    addNodeAfterCurrent(givenList, newNode);
+    unlockMutex();
     return LIST_SUCCESS;
 }
 
-// Add before current
-int List_insert(List* pList, void* pItem)
+// Function to add an item before the current item
+int ListInsert(List* givenList, void* item)
 {
-    mutexLock();
-    // Get free node
-    if (haveNoFreeNodes()) {
-        mutexUnlock();
+    lockMutex();
+    if (isNodesEmpty()) {
+        unlockMutex();
         return LIST_FAIL;
     }
-    Node* pNode = makeNewNode(pItem);
-    
-    // Insert
-    List_prev(pList);
-    linkNodeAfterCurrent(pList, pNode);
-    mutexUnlock();
+    Node* newNode = createNode(item);
+    ListPrev(givenList);
+    addNodeAfterCurrent(givenList, newNode);
+    unlockMutex();
     return LIST_SUCCESS;
 }
 
-// Add at end
-int List_append(List* pList, void* pItem)
+// Function to add an item at the end of the list
+int ListEndAdd(List* givenList, void* item)
 {
-    mutexLock();
-    // Get free node
-    if (haveNoFreeNodes()) {
-        mutexUnlock();
+    lockMutex();
+    if (isNodesEmpty()) {
+        unlockMutex();
         return LIST_FAIL;
     }
-    Node* pNode = makeNewNode(pItem);
-    
-    // Insert
-    pList->pCurrentNode = pList->pLastNode;
-    linkNodeAtEnd(pList, pNode);
-    mutexUnlock();
+    Node* newNode = createNode(item);
+    givenList->currentNode = givenList->lastNode;
+    addNodeAtEnd(givenList, newNode);
+    unlockMutex();
     return LIST_SUCCESS;
 }
 
-// Add at beginning
-int List_prepend(List* pList, void* pItem)
+// Function to add an item at the start of the list
+int ListStartAdd(List* givenList, void* item)
 {
-    mutexLock();
-
-    // Get free node
-    if (haveNoFreeNodes()) {
-        mutexUnlock();
+    lockMutex();
+    if (isNodesEmpty()) {
+        unlockMutex();
         return LIST_FAIL;
     }
-    Node* pNode = makeNewNode(pItem);
-    
-    // Insert
-    linkNodeAtStart(pList, pNode);
-    mutexUnlock();
+    Node* newNode = createNode(item);
+    addNodeAtStart(givenList, newNode);
+    unlockMutex();
     return LIST_SUCCESS;
 }
 
-// Remove current
-void* List_remove(List* pList)
+// Function to remove the current item from the list
+void* ListRemove(List* givenList)
 {
-    mutexLock();
-
-    if (pList->count == 0
-        || isOOBAtStart(pList)
-        || isOOBAtEnd(pList)
+    lockMutex();
+    if (givenList->count == 0
+        || isOutOfBoundsStart(givenList)
+        || isOutOfBoundsEnd(givenList)
     ) {
-        mutexUnlock();
+        unlockMutex();
         return NULL;
     }
+    Node* removeNode = givenList->currentNode;
+    void* item = removeNode->item;
+    Node* prevNode = removeNode->prev;
+    Node* nextNode = removeNode->next;
 
-    // Get node/item
-    Node* pRemoveNode = pList->pCurrentNode;
-    void* pItem = pRemoveNode->pItem;
-
-    // Unlink forwards
-    Node* pPrevNode = pRemoveNode->pPrev;
-    Node* pNextNode = pRemoveNode->pNext;
-    if (pPrevNode != NULL) {
-        pPrevNode->pNext = pNextNode;
+    if (prevNode != NULL) {
+        prevNode->next = nextNode;
     } else {
-        pList->pFirstNode = pNextNode;
+        givenList->firstNode = nextNode;
     }
-
-    // Unlink backwards
-    if (pNextNode != NULL) {
-        pNextNode->pPrev = pPrevNode;
+    if (nextNode != NULL) {
+        nextNode->prev = prevNode;
     } else {
-        pList->pLastNode = pPrevNode;
+        givenList->lastNode = prevNode;
     }
-    pList->count --;
-
-    // Recover node
-    pRemoveNode->pNext = s_pFirstFreeNode;
-    s_pFirstFreeNode = pRemoveNode;
-
-    // Reset current to last (smartly)
-    pList->pCurrentNode = pNextNode;
-    if (pList->pCurrentNode == NULL) {
-        pList->lastOutOfBoundsReason = LIST_OOB_END;
+    givenList->count --;
+    removeNode->next = freeNode;
+    freeNode = removeNode;
+    givenList->currentNode = nextNode;
+    if (givenList->currentNode == NULL) {
+        givenList->lastOutOfBoundsReason = LIST_OOB_END;
     }
-    mutexUnlock();
-    return pItem;
+    unlockMutex();
+    return item;
 }
 
-// Remove last
-void* List_trim(List* pList)
+// Function for getting the last element from the list and removing it
+void* extractLast(List* listHandle)
 {
-    mutexLock();
+    // Lock the list to avoid conflicts
+    accessMutex();
 
-    List_last(pList);
-    void* pItem = List_remove(pList);
-    List_last(pList);
+    // Set the pointer to the last node and remove it
+    moveToLast(listHandle);
+    void* lastItem = removeCurrent(listHandle);
+    moveToLast(listHandle);
     
-    mutexUnlock();
-    return pItem;
+    // Unlock the list after modification
+    releaseMutex();
+    return lastItem;
 }
 
-void List_concat(List* pList1, List* pList2)
+// Function for merging two lists
+void mergeLists(List* primaryList, List* secondaryList)
 {
-    mutexLock();
+    // Lock the list to avoid conflicts
+    accessMutex();
 
-    // Relink Nodes from list 2 to list 1:
-    Node* pTail1 = pList1->pLastNode;
-    Node* pHead2 = pList2->pFirstNode;
-    if (pHead2 == NULL) {
-        // 2nd list is empty; done!
-    } else if (pTail1 == NULL) {
-        pList1->pFirstNode = pHead2;
-        pList1->pLastNode = pList2->pLastNode;
+    // Reconnecting the nodes from the secondary list to the primary list
+    Node* lastPrimaryNode = primaryList->lastNode;
+    Node* firstSecondaryNode = secondaryList->firstNode;
+    if (firstSecondaryNode == NULL) {
+        // If secondary list is empty, then nothing to do
+    } else if (lastPrimaryNode == NULL) {
+        primaryList->firstNode = firstSecondaryNode;
+        primaryList->lastNode = secondaryList->lastNode;
     } else {
-        pTail1->pNext = pHead2;
-        pHead2->pPrev = pTail1;
-        pList1->pLastNode = pList2->pLastNode;        
+        lastPrimaryNode->next = firstSecondaryNode;
+        firstSecondaryNode->prev = lastPrimaryNode;
+        primaryList->lastNode = secondaryList->lastNode;        
     }
-    pList1->count += pList2->count;
+    primaryList->nodeCount += secondaryList->nodeCount;
 
-    pList2->count = 0;
-    pList2->pCurrentNode = NULL;
-    pList2->pFirstNode = NULL;
-    pList2->pLastNode = NULL;
+    secondaryList->nodeCount = 0;
+    secondaryList->currentNode = NULL;
+    secondaryList->firstNode = NULL;
+    secondaryList->lastNode = NULL;
 
-    // Delete the list
-    // O(1) because the list is empty.
-    List_free(pList2, NULL);
+    // Deallocate the secondary list, which is now empty.
+    deallocList(secondaryList, NULL);
 
-    mutexUnlock();
+    // Unlock the list after modification
+    releaseMutex();
 }
 
-void List_free(List* pList, FREE_FN pItemFreeFn)
+// Function for deallocating the list and its nodes
+void deallocList(List* listHandle, DEALLOC_FN deallocator)
 {
-    mutexLock();
-    // Free all nodes
-    while (List_count(pList) > 0) {
-        Node* pNode = List_trim(pList);
+    // Lock the list to avoid conflicts
+    accessMutex();
+    // Deallocate all nodes
+    while (nodeCount(listHandle) > 0) {
+        Node* node = extractLast(listHandle);
 
-        // Call free function (possibly cleaning up memory)
-        if (pItemFreeFn != NULL) {
-            (*pItemFreeFn)(pNode);
+        // Invoke deallocator function to clean up the memory
+        if (deallocator != NULL) {
+            (*deallocator)(node);
         }
     }
 
-    // Free list
-    pList->pNextFreeHead = s_pFirstFreeHead;
-    s_pFirstFreeHead = pList;
-    mutexUnlock();
+    // Deallocate list
+    listHandle->nextFreeList = firstFreeList;
+    firstFreeList = listHandle;
+    releaseMutex();
 }
 
-// Search pList, starting at the current item, until the end is reached or a match is found. 
-// In this context, a match is determined by the comparator parameter. This parameter is a
-// pointer to a routine that takes as its first argument an item pointer, and as its second 
-// argument pComparisonArg. Comparator returns 0 if the item and comparisonArg don't match, 
-// or 1 if they do. Exactly what constitutes a match is up to the implementor of comparator. 
-// 
-// If a match is found, the current pointer is left at the matched item and the pointer to 
-// that item is returned. If no match is found, the current pointer is left beyond the end of 
-// the list and a NULL pointer is returned.
-void* List_search(List* pList, COMPARATOR_FN pComparator, void* pComparisonArg)
+// Function to search through the list from the current item until the end, 
+// returns a pointer to the item if a match is found, NULL otherwise.
+void* searchList(List* listHandle, COMPARE_FN comparator, void* comparisonArg)
 {
-    mutexLock();
-    if (isOOBAtStart(pList)) {
-        List_first(pList);
+    // Lock the list to avoid conflicts
+    accessMutex();
+    if (atListStart(listHandle)) {
+        moveToFirst(listHandle);
     }
 
-    while(pList->pCurrentNode != NULL) {
-        // Match? 
-        void* pItem = pList->pCurrentNode->pItem;
-        if ( (*pComparator)(pItem, pComparisonArg) == 1) {
-            return pItem;
+    while(listHandle->currentNode != NULL) {
+        // Checking for a match
+        void* item = listHandle->currentNode->item;
+        if ( (*comparator)(item, comparisonArg) == 1) {
+            return item;
         }
 
-        List_next(pList);
+        moveToNext(listHandle);
     }
-    mutexUnlock();
+    // Unlock the list after searching
+    releaseMutex();
     return NULL;
 }
 
 
 
+//-----PRIVATE FUNCTIONS-------
 
-
-
-
-/*
-    PRIVATE FUNCTIONS
-*/
-static void initializeDataStructures() {
-    mutexInitialize();
+// Function for initializing data structures
+static void setupDataStructures() {
+    initMutex();
     
-    mutexLock();
+    accessMutex();
 
-    assert(LIST_MAX_NUM_NODES > 0);
-    assert(LIST_MAX_NUM_HEADS > 0);
+    assert(MAX_LIST_NODES > 0);
+    assert(MAX_LIST_HEADS > 0);
 
 
-    // Nodes
-    s_pFirstFreeNode = &s_nodes[0];
-    for (int i = 0; i < LIST_MAX_NUM_NODES; i++) {
-        s_nodes[i].pItem = NULL;
-        s_nodes[i].pPrev = NULL;
-        s_nodes[i].pNext = NULL;
-        if (i + 1 < LIST_MAX_NUM_NODES) {
-            s_nodes[i].pNext = &s_nodes[i+1];
+    // Setting up nodes
+    firstFreeNode = &nodeArray[0];
+    for (int i = 0; i < MAX_LIST_NODES; i++) {
+        nodeArray[i].item = NULL;
+        nodeArray[i].prev = NULL;
+        nodeArray[i].next = NULL;
+        if (i + 1 < MAX_LIST_NODES) {
+            nodeArray[i].next = &nodeArray[i+1];
         }
     }
 
-    // Heads
-    s_pFirstFreeHead = &s_heads[0];
-    for (int i = 0; i < LIST_MAX_NUM_HEADS; i++) {
-        s_heads[i].count = 0;
-        s_heads[i].pCurrentNode = NULL;
-        s_heads[i].lastOutOfBoundsReason = LIST_OOB_START;
-        s_heads[i].pFirstNode = NULL;
-        s_heads[i].pLastNode = NULL;
-        s_heads[i].pNextFreeHead = NULL;
-        if (i + 1 < LIST_MAX_NUM_HEADS) {
-            s_heads[i].pNextFreeHead = &s_heads[i + 1];
+    // Setting up list heads
+    firstFreeList = &listArray[0];
+    for (int i = 0; i < MAX_LIST_HEADS; i++) {
+        listArray[i].nodeCount = 0;
+        listArray[i].currentNode = NULL;
+        listArray[i].outOfBoundsReason = LIST_START_OOB;
+        listArray[i].firstNode = NULL;
+        listArray[i].lastNode = NULL;
+        listArray[i].nextFreeList = NULL;
+        if (i + 1 < MAX_LIST_HEADS) {
+            listArray[i].nextFreeList = &listArray[i + 1];
         }
     }
-    s_isInitialized = true;
-    mutexUnlock();
+    initialized = true;
+    releaseMutex();
 }
 
-static bool isOOBAtStart(List* pList) {
-    assert(pList->lastOutOfBoundsReason == LIST_OOB_START 
-        || pList->lastOutOfBoundsReason == LIST_OOB_END);
-    return pList->pCurrentNode == NULL 
-        && pList->lastOutOfBoundsReason == LIST_OOB_START;
+// Function for checking if the current position is at the start of the list
+static bool atListStart(List* listHandle) {
+    assert(listHandle->outOfBoundsReason == LIST_START_OOB 
+        || listHandle->outOfBoundsReason == LIST_END_OOB);
+    return listHandle->currentNode == NULL 
+        && listHandle->outOfBoundsReason == LIST_START_OOB;
 }
-static bool isOOBAtEnd(List* pList) {
-    assert(pList->lastOutOfBoundsReason == LIST_OOB_START 
-        || pList->lastOutOfBoundsReason == LIST_OOB_END);
+// Function for checking if the current position is at the end of the list
+static bool atListEnd(List* listHandle) {
+    assert(listHandle->outOfBoundsReason == LIST_START_OOB 
+        || listHandle->outOfBoundsReason == LIST_END_OOB);
 
-    return pList->pCurrentNode == NULL 
-        && pList->lastOutOfBoundsReason == LIST_OOB_END;
+    return listHandle->currentNode == NULL 
+        && listHandle->outOfBoundsReason == LIST_END_OOB;
 }

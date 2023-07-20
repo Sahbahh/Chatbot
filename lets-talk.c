@@ -7,11 +7,13 @@
 #include <sys/socket.h> 
 #include <arpa/inet.h> 
 #include <netinet/in.h> 
-#include "list.h"
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
 #include <sys/time.h>
+
+#include "list.h"
+
 #define STDIN 0 
 
 pthread_mutex_t Mutex = PTHREAD_MUTEX_INITIALIZER;

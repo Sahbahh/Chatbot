@@ -1,4 +1,4 @@
-# Socket-Chat
+# Socket-Chatbot
 
 ## "chat"-like facility that enables a user at one terminal to communicate with a user at another terminal.
 
